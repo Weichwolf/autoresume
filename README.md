@@ -8,7 +8,7 @@ Eligible sessions have an active goal, or a goal marked **stalled** by a capacit
 
 ## Install
 
-Requires Python 3.10+ and a running Codex app-server with goal support. Tested with Codex 0.162.1 on Linux. The Python watcher should also work on macOS, but has not been tested there; service management requires Linux with systemd. The app-server protocol is experimental.
+Requires Python 3.10+ and a running Codex app-server with goal support. Service management supports Linux with systemd and macOS with launchd. Tested with Codex 0.162.1. The app-server protocol is experimental.
 
 ```bash
 git clone https://github.com/Weichwolf/codex-autoresume.git
@@ -31,13 +31,16 @@ python3 -m venv .venv
 
 # Status and logs
 .venv/bin/codex-autoresume --service-status
+# Linux
 journalctl --user -u codex-autoresume -f
+# macOS
+tail -f ~/.local/state/codex-autoresume/service.log
 
 # Stop, disable, and remove the service
 .venv/bin/codex-autoresume --uninstall-service
 ```
 
-To start at boot without logging in, also run `loginctl enable-linger "$USER"`. Each user can run an independent service for their own Codex sessions. Reinstalling updates the service paths/options and restarts it. Add `--dry-run` to preview service installation.
+On Linux, use `loginctl enable-linger "$USER"` to start at boot without logging in. On macOS, the LaunchAgent starts at login and restarts the watcher if it exits; it runs in the user's GUI session. Each user can run an independent service for their own Codex sessions. Reinstalling updates the service paths/options and restarts it. Add `--dry-run` to preview service installation. Keep the repository and virtual environment at their installed paths.
 
 ## Options and behavior
 
@@ -49,7 +52,7 @@ To start at boot without logging in, also run `loginctl enable-linger "$USER"`. 
 
 Running turns, approval/input dialogs, manually interrupted turns, paused/completed goals, exhausted budgets, and known non-retryable errors are skipped. Goal text, budgets, and usage are preserved. State is checked again before resuming; the protocol does not provide an atomic conditional resume.
 
-The default socket is `${CODEX_HOME:-~/.codex}/app-server-control/app-server-control.sock`. State is stored in `${XDG_STATE_HOME:-~/.local/state}/codex-autoresume/`; service configuration in `${XDG_CONFIG_HOME:-~/.config}/systemd/user/`. Separate servers such as `--no-daemon` sessions are not automatically covered. The watcher reconnects but does not start or restart Codex itself.
+The default socket is `${CODEX_HOME:-~/.codex}/app-server-control/app-server-control.sock`. State is stored in `${XDG_STATE_HOME:-~/.local/state}/codex-autoresume/`; service configuration in `${XDG_CONFIG_HOME:-~/.config}/systemd/user/` on Linux or `~/Library/LaunchAgents/com.weichwolf.codex-autoresume.plist` on macOS. macOS logs are written to `service.log` in the selected state directory. Separate servers such as `--no-daemon` sessions are not automatically covered. The watcher reconnects but does not start or restart Codex itself.
 
 Service installation saves the selected options, for example:
 
@@ -65,4 +68,4 @@ Run `codex-autoresume --help` for all options.
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-Tests use simulated sessions, an isolated Unix WebSocket server, and a fake systemctl. They do not start real Codex turns or install real services.
+Tests use simulated sessions, an isolated Unix WebSocket server, and fake systemctl/launchctl executables. Both service lifecycles are tested on either supported platform. Tests do not start real Codex turns or install real services.

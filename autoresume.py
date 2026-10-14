@@ -13,6 +13,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import plistlib
 import random
 import shutil
 import signal
@@ -29,6 +30,7 @@ LOG = logging.getLogger("autoresume")
 VERSION = "0.1.0"
 SERVICE_NAME = "codex-autoresume.service"
 SERVICE_MARKER = "# Managed by codex-autoresume"
+LAUNCHD_LABEL = "com.weichwolf.codex-autoresume"
 TRANSIENT = {
     "serverOverloaded", "internalServerError", "rateLimitExceeded", "flexUnavailable",
     "responseStreamConnectionFailed", "responseStreamDisconnected",
@@ -356,7 +358,7 @@ def systemd_argument(value):
     return '"' + value + '"'
 
 
-def service_unit(args, python=None, script=None):
+def service_command(args, python=None, script=None):
     # Keep the venv interpreter path: resolve() would follow its symlink to the
     # base Python interpreter, which doesn't have this package's dependencies.
     command = [os.path.abspath(python or sys.executable),
@@ -370,6 +372,11 @@ def service_unit(args, python=None, script=None):
     for name in ["errors_only", "verbose"]:
         if getattr(args, name):
             command.append("--" + name.replace("_", "-"))
+    return command
+
+
+def service_unit(args, python=None, script=None):
+    command = service_command(args, python, script)
     return "\n".join([
         SERVICE_MARKER, "[Unit]", "Description=Resume stalled Codex sessions with active goals",
         "", "[Service]", "Type=simple",
@@ -388,9 +395,84 @@ def run_systemctl(*arguments, check=True):
     return result
 
 
+def launchd_plist(args, python=None, script=None):
+    log_path = args.state_dir.absolute() / "service.log"
+    return plistlib.dumps({
+        "Label": LAUNCHD_LABEL, "ManagedBy": SERVICE_MARKER,
+        "ProgramArguments": service_command(args, python, script),
+        "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 15,
+        "Umask": 0o077, "StandardOutPath": str(log_path),
+        "StandardErrorPath": str(log_path),
+    })
+
+
+def run_launchctl(*arguments, check=True):
+    result = subprocess.run(["launchctl", *arguments],
+                            capture_output=True, text=True, timeout=30)
+    if check and result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"launchctl {' '.join(arguments)} failed: {detail}")
+    return result
+
+
+def manage_launchd(args):
+    unit_path = Path.home() / "Library/LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+    domain = f"gui/{os.getuid()}"
+    target = f"{domain}/{LAUNCHD_LABEL}"
+    if args.dry_run:
+        if args.install_service:
+            print(launchd_plist(args).decode(), end="")
+        LOG.info("DRY RUN: would %s %s (%s)",
+                 "install/start" if args.install_service else "remove" if args.uninstall_service else "inspect",
+                 target, unit_path)
+        return 0
+    if not shutil.which("launchctl"):
+        raise RuntimeError("launchctl was not found")
+    if args.service_status:
+        result = run_launchctl("print", target, check=False)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        return result.returncode
+    run_launchctl("print", domain)
+    if unit_path.exists() or unit_path.is_symlink():
+        if unit_path.is_symlink() or plistlib.loads(unit_path.read_bytes()).get("ManagedBy") != SERVICE_MARKER:
+            raise RuntimeError(f"Existing service {unit_path} is not managed by this script; move it aside first")
+    loaded = run_launchctl("print", target, check=False)
+    if loaded.returncode not in {0, 113}:
+        raise RuntimeError(f"Cannot inspect {target}: {loaded.stderr.strip()}")
+    if not loaded.returncode:
+        if not unit_path.exists():
+            raise RuntimeError(f"Loaded service {target} has no managed plist at {unit_path}")
+        run_launchctl("bootout", target)
+    if args.install_service:
+        content = launchd_plist(args)
+        args.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        unit_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".codex-autoresume-", dir=unit_path.parent)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(content)
+            os.replace(temporary, unit_path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        run_launchctl("enable", target)
+        run_launchctl("bootstrap", domain, str(unit_path))
+        run_launchctl("print", target)
+        LOG.info("Installed and started %s (%s)", LAUNCHD_LABEL, unit_path)
+    elif unit_path.exists():
+        unit_path.unlink()
+        LOG.info("Stopped and removed %s", unit_path)
+    else:
+        LOG.info("No service installed at %s", unit_path)
+    return 0
+
+
 def manage_service(args):
+    if sys.platform == "darwin":
+        return manage_launchd(args)
     if not sys.platform.startswith("linux"):
-        raise RuntimeError("Service management requires Linux with systemd; run the watcher directly on macOS")
+        raise RuntimeError("Service management requires Linux with systemd or macOS with launchd")
     config_home = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser().absolute()
     unit_path = config_home / "systemd/user" / SERVICE_NAME
     if args.dry_run:
@@ -463,9 +545,9 @@ def parse_args(argv=None):
     parser.add_argument("--rpc-timeout", type=positive, default=15)
     parser.add_argument("--verbose", action="store_true")
     service = parser.add_mutually_exclusive_group()
-    service.add_argument("--install-service", action="store_true", help="Install, enable and start the systemd user service with these options")
-    service.add_argument("--uninstall-service", action="store_true", help="Stop, disable and remove the systemd user service")
-    service.add_argument("--service-status", action="store_true", help="Show systemd user service status")
+    service.add_argument("--install-service", action="store_true", help="Install, enable and start the user service with these options")
+    service.add_argument("--uninstall-service", action="store_true", help="Stop and remove the user service")
+    service.add_argument("--service-status", action="store_true", help="Show user service status")
     args = parser.parse_args(argv)
     if args.jitter >= 1:
         parser.error("--jitter must be less than 1")
