@@ -415,6 +415,20 @@ def run_launchctl(*arguments, check=True):
     return result
 
 
+def bootstrap_launchd(domain, unit_path):
+    # bootout returns before launchd finishes removing the old service.
+    deadline, delay = time.monotonic() + 10, 0.1
+    while True:
+        result = run_launchctl("bootstrap", domain, str(unit_path), check=False)
+        if not result.returncode:
+            return
+        remaining = deadline - time.monotonic()
+        if result.returncode != 5 or remaining <= 0:
+            raise RuntimeError(f"launchctl bootstrap {domain} {unit_path} failed: {result.stderr.strip()}")
+        time.sleep(min(delay, remaining))
+        delay = min(delay * 2, 1)
+
+
 def manage_launchd(args):
     unit_path = Path.home() / "Library/LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
     domain = f"gui/{os.getuid()}"
@@ -457,7 +471,7 @@ def manage_launchd(args):
             if os.path.exists(temporary):
                 os.unlink(temporary)
         run_launchctl("enable", target)
-        run_launchctl("bootstrap", domain, str(unit_path))
+        bootstrap_launchd(domain, unit_path)
         run_launchctl("print", target)
         LOG.info("Installed and started %s (%s)", LAUNCHD_LABEL, unit_path)
     elif unit_path.exists():

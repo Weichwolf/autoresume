@@ -4,7 +4,6 @@ import os
 from pathlib import Path
 import plistlib
 import shlex
-import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -163,15 +162,21 @@ with Path(os.environ['LAUNCHCTL_TEST_LOG']).open('a') as f:
 loaded = Path(os.environ['LAUNCHCTL_TEST_LOADED'])
 if os.environ.get('LAUNCHCTL_TEST_FAIL') == args[0]:
     print('simulated failure', file=sys.stderr)
-    sys.exit(1)
+    sys.exit(int(os.environ.get('LAUNCHCTL_TEST_FAIL_CODE', '1')))
 if args[0] == 'print':
     if args[1].endswith('codex-autoresume') and not loaded.exists():
         sys.exit(113)
     print('service status')
 if args[0] == 'bootstrap':
+    pending = loaded.with_name('pending')
+    if pending.exists() and int(pending.read_text()):
+        pending.write_text(str(int(pending.read_text()) - 1))
+        print('service still being removed', file=sys.stderr)
+        sys.exit(5)
     loaded.touch()
 if args[0] == 'bootout':
     loaded.unlink()
+    loaded.with_name('pending').write_text(os.environ.get('LAUNCHCTL_TEST_TEARDOWN_ATTEMPTS', '0'))
 """)
         launchctl.chmod(0o755)
         for context in [patch("autoresume.sys.platform", "darwin"),
@@ -246,6 +251,21 @@ if args[0] == 'bootout':
             self.assertEqual(self.run_cli("--uninstall-service"), 1)
         self.assertTrue(self.unit.exists())
         self.assertTrue(self.loaded.exists())
+
+    def test_reinstall_retries_while_old_service_is_being_removed(self):
+        self.assertEqual(self.run_cli("--install-service"), 0)
+        self.log.unlink()
+        with patch.dict(os.environ, {"LAUNCHCTL_TEST_TEARDOWN_ATTEMPTS": "2"}):
+            self.assertEqual(self.run_cli("--install-service"), 0)
+        self.assertEqual(sum(command[0] == "bootstrap" for command in self.commands()), 3)
+        self.assertTrue(self.loaded.exists())
+
+    def test_persistent_bootstrap_error_is_bounded_and_reported(self):
+        with patch.dict(os.environ, {"LAUNCHCTL_TEST_FAIL": "bootstrap", "LAUNCHCTL_TEST_FAIL_CODE": "5"}):
+            with patch("autoresume.time.monotonic", side_effect=[0, 11]):
+                self.assertEqual(self.run_cli("--install-service"), 1)
+        self.assertFalse(self.loaded.exists())
+        self.assertEqual(sum(command[0] == "bootstrap" for command in self.commands()), 1)
 
     def test_status_returns_missing_service_exit_code(self):
         with redirect_stdout(io.StringIO()):
