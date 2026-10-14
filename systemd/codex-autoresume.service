@@ -1,0 +1,14 @@
+# Managed by codex-autoresume
+[Unit]
+Description=Resume stalled Codex sessions with active goals
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Git/codex-autoresume
+ExecStart=%h/Git/codex-autoresume/.venv/bin/codex-autoresume
+Restart=on-failure
+RestartSec=15
+UMask=0077
+
+[Install]
+WantedBy=default.target

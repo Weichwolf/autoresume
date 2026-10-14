@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-autoresume"
+version = "0.1.0"
+description = "Resume stalled Codex sessions with active goals through the local app-server"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["websockets>=15,<18"]
+license = "MIT"
+
+[project.scripts]
+codex-autoresume = "autoresume:main"
+
+[tool.setuptools]
+py-modules = ["autoresume"]
