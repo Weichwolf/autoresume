@@ -170,11 +170,13 @@ def blocked_reason(snapshot, errors_only=False):
     goal, turn = snapshot["goal"], snapshot["turn"]
     if not goal or goal["status"] not in {"active", "blocked", "stalled"}:
         return "no-active-goal"
+    retryable_turn = bool(turn and turn["status"] in {"failed", "interrupted"}
+                          and transient_error(turn.get("error")))
     # The UI labels a goal stalled when a provider error changes its persisted
-    # status to blocked. Recover only when the latest failed turn proves a
-    # transient provider/connection failure, not for ordinary task blockers.
+    # status to blocked. Recover only when the latest failed or interrupted
+    # turn proves a transient provider/connection failure, not a task blocker.
     if goal["status"] in {"blocked", "stalled"}:
-        if not turn or turn["status"] != "failed" or not transient_error(turn.get("error")):
+        if not retryable_turn:
             return "goal-blocked"
     budget = goal.get("tokenBudget")
     if budget is not None and goal.get("tokensUsed", 0) >= budget:
@@ -186,13 +188,15 @@ def blocked_reason(snapshot, errors_only=False):
         return "unknown-runtime"
     if snapshot.get("retrying"):
         return "codex-retrying"
-    if turn and turn["status"] == "interrupted":
+    # An interruption alone does not identify its cause. Require a transient
+    # error on this same turn before treating it as a technical interruption.
+    if turn and turn["status"] == "interrupted" and not retryable_turn:
         return "interrupted"
     error = (turn or {}).get("error")
     kind, status = error_kind(error)
     if kind in TERMINAL or (status is not None and 400 <= status < 500 and status not in {408, 429}):
         return "non-retryable-error"
-    if errors_only and (not turn or turn["status"] != "failed" or not transient_error(error)):
+    if errors_only and not retryable_turn:
         return "no-transient-error"
     return None
 
@@ -549,7 +553,7 @@ def parse_args(argv=None):
     parser.add_argument("--thread", action="append", help="Only watch this thread UUID; repeatable; default: all")
     parser.add_argument("--dry-run", action="store_true", help="Read sessions and log plans; no resume or state writes")
     parser.add_argument("--once", action="store_true", help="Scan once; normal idle grace still applies")
-    parser.add_argument("--errors-only", action="store_true", help="Only resume failed turns with capacity/connection errors")
+    parser.add_argument("--errors-only", action="store_true", help="Only resume failed or interrupted turns with capacity/connection errors")
     parser.add_argument("--interval", type=positive, default=15, help="Scan interval in seconds (default: 15)")
     parser.add_argument("--idle-seconds", type=nonnegative, default=60, help="Continuous observed idle grace (default: 60)")
     parser.add_argument("--initial-backoff", type=positive, default=60)

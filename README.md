@@ -44,13 +44,15 @@ On Linux, use `loginctl enable-linger "$USER"` to start at boot without logging 
 
 ## Options and behavior
 
-- `--errors-only`: only resume failed turns with capacity or connection errors. By default, any eligible idle session with an active goal is considered.
+- `--errors-only`: only resume failed or interrupted turns with capacity or connection errors. By default, any eligible idle session with an active goal is considered.
 - `--thread UUID`: watch a specific session; repeatable.
 - `--idle-seconds 120`: change the inactivity grace period.
 - `--socket PATH` / `--codex-home PATH`: use a different local server.
 - `--once`: scan once, respecting the normal grace period and cooldown.
 
-Running turns, approval/input dialogs, manually interrupted turns, paused/completed goals, exhausted budgets, and known non-retryable errors are skipped. Goal text, budgets, and usage are preserved. State is checked again before resuming; the protocol does not provide an atomic conditional resume.
+Interrupted turns are eligible only when the same turn carries a recognized transient capacity or connection error, including for stalled goals and with `--errors-only`. The `interrupted` status or the generic "Conversation interrupted" message alone is not enough to identify a technical failure.
+
+Running turns, approval/input dialogs, interruptions without a recognized transient error, paused/completed goals, exhausted budgets, and known non-retryable errors are skipped. Goal text, budgets, and usage are preserved. State is checked again before resuming; the protocol does not provide an atomic conditional resume.
 
 The default socket is `${CODEX_HOME:-~/.codex}/app-server-control/app-server-control.sock`. State is stored in `${XDG_STATE_HOME:-~/.local/state}/codex-autoresume/`; service configuration in `${XDG_CONFIG_HOME:-~/.config}/systemd/user/` on Linux or `~/Library/LaunchAgents/com.weichwolf.codex-autoresume.plist` on macOS. macOS logs are written to `service.log` in the selected state directory. Separate servers such as `--no-daemon` sessions are not automatically covered. The watcher reconnects but does not start or restart Codex itself.
 

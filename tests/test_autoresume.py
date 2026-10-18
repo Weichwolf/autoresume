@@ -85,10 +85,40 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(blocked_reason(s, errors_only=True), "no-transient-error")
 
     def test_explicit_interrupt_and_exhausted_budget_are_preserved(self):
-        self.assertEqual(blocked_reason(snapshot(turn_status="interrupted")), "interrupted")
+        s = snapshot(turn_status="interrupted")
+        s["turn"]["error"] = None
+        self.assertEqual(blocked_reason(s), "interrupted")
         s = snapshot()
         s["goal"]["tokensUsed"] = 1000
         self.assertEqual(blocked_reason(s), "budget-exhausted")
+
+    def test_interrupted_turn_requires_transient_error_on_same_turn(self):
+        for goal in ["active", "blocked", "stalled"]:
+            for errors_only in [False, True]:
+                for error in [
+                    {"codexErrorInfo": "serverOverloaded"},
+                    {"codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": None}}},
+                    {"codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 503}}},
+                    {"message": "Connection reset by peer"},
+                ]:
+                    with self.subTest(goal=goal, errors_only=errors_only, error=error):
+                        s = snapshot(goal=goal, turn_status="interrupted", error=error)
+                        self.assertIsNone(blocked_reason(s, errors_only=errors_only))
+
+    def test_ambiguous_or_non_retryable_interruptions_are_skipped(self):
+        for goal in ["active", "blocked", "stalled"]:
+            for errors_only in [False, True]:
+                for error in [
+                    None, {}, {"message": "Interrupted by user"},
+                    {"message": "Conversation interrupted - use /feedback if something went wrong"},
+                    {"message": "Unknown error", "codexErrorInfo": "other"},
+                    {"message": "Connection failed", "codexErrorInfo": "usageLimitExceeded"},
+                    {"message": "Connection failed", "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 401}}},
+                ]:
+                    with self.subTest(goal=goal, errors_only=errors_only, error=error):
+                        s = snapshot(goal=goal, turn_status="interrupted")
+                        s["turn"]["error"] = error
+                        self.assertIsNotNone(blocked_reason(s, errors_only=errors_only))
 
     def test_http_errors_are_classified_before_message_fallback(self):
         for code in [401, 403, 404]:
@@ -140,6 +170,39 @@ class WatchdogTests(unittest.TestCase):
         }
         self.watch.scan()
         self.assertEqual(self.rpc.actions, [("resume", "capacity")])
+
+    def test_technical_interruption_obeys_grace_and_backoff(self):
+        self.args.errors_only = True
+        self.rpc.snapshots = {
+            "technical": snapshot(goal="blocked", turn_status="interrupted"),
+            "manual": snapshot(turn_status="interrupted"),
+        }
+        self.rpc.snapshots["manual"]["turn"]["error"] = None
+        self.watch.scan()
+        self.assertEqual(self.rpc.actions, [])
+        self.now += 60
+        self.watch.scan()
+        self.assertEqual(self.rpc.actions, [("resume", "technical")])
+        self.watch.scan()
+        self.assertEqual(self.rpc.actions, [("resume", "technical")])
+        self.now += 60
+        self.watch.scan()
+        self.assertEqual(self.rpc.actions, [("resume", "technical"), ("resume", "technical")])
+
+    def test_interruption_error_is_rechecked_before_resume(self):
+        self.args.idle_seconds = 0
+        self.rpc.snapshots["t1"] = snapshot(turn_status="interrupted")
+        reads = 0
+
+        def clear_error(_):
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                self.rpc.snapshots["t1"]["turn"]["error"] = None
+
+        self.rpc.before_read = clear_error
+        self.assertEqual(self.watch.scan()["changed-before-resume"], 1)
+        self.assertEqual(self.rpc.actions, [])
 
     def test_grace_restarts_after_running(self):
         self.watch.scan()
@@ -303,6 +366,7 @@ class ProtocolTests(unittest.TestCase):
         self.responses = []
         self.runtime = "idle"
         self.goal_status = "active"
+        self.turn = snapshot()["turn"]
         self.disconnect_once = False
         self.resumed = threading.Event()
         self.server = unix_serve(self.handler, str(self.sock))
@@ -337,7 +401,7 @@ class ProtocolTests(unittest.TestCase):
             elif method == "thread/goal/get":
                 result = {"goal": snapshot(goal=self.goal_status)["goal"]}
             elif method == "thread/turns/list":
-                result = {"data": [snapshot()["turn"]]}
+                result = {"data": [self.turn]}
             elif method == "thread/goal/set":
                 self.mutations.append(params)
                 self.runtime = "active"
@@ -373,6 +437,17 @@ class ProtocolTests(unittest.TestCase):
                        "--once", "--idle-seconds", "0", "--thread", "t1"])
         self.assertEqual(result, 0)
         self.assertEqual(len(self.mutations), 1)
+
+    def test_cli_recovers_interrupted_goal_with_connection_error(self):
+        self.goal_status = "blocked"
+        self.turn = snapshot(turn_status="interrupted", error={
+            "message": "Stream disconnected",
+            "codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": 502}},
+        })["turn"]
+        result = main(["--socket", str(self.sock), "--state-dir", self.temp.name,
+                       "--once", "--idle-seconds", "0", "--thread", "t1", "--errors-only"])
+        self.assertEqual(result, 0)
+        self.assertEqual(self.mutations, [{"threadId": "t1", "status": "active", "origin": "user"}])
 
     def test_cli_dry_run_never_mutates_server(self):
         result = main(["--socket", str(self.sock), "--state-dir", self.temp.name,
