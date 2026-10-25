@@ -34,11 +34,11 @@ LAUNCHD_LABEL = "com.weichwolf.codex-autoresume"
 TRANSIENT = {
     "serverOverloaded", "internalServerError", "rateLimitExceeded", "flexUnavailable",
     "responseStreamConnectionFailed", "responseStreamDisconnected",
-    "responseTooManyFailedAttempts",
+    "responseTooManyFailedAttempts", "cyberPolicy",
 }
 TERMINAL = {
     "usageLimitExceeded", "sessionBudgetExceeded", "contextWindowExceeded",
-    "unauthorized", "badRequest", "cyberPolicy", "misalignmentPolicyViolation",
+    "unauthorized", "badRequest", "misalignmentPolicyViolation",
     "tooManyDenials", "sandboxError",
 }
 
@@ -163,6 +163,7 @@ def transient_error(error):
         "at capacity", "overloaded", "connection error", "connection failed",
         "connection reset", "connection closed", "stream disconnected",
         "timed out", "timeout", "temporarily unavailable",
+        "this content can’t be shown", "this content can't be shown",
     ))
 
 
@@ -174,7 +175,7 @@ def blocked_reason(snapshot, errors_only=False):
                           and transient_error(turn.get("error")))
     # The UI labels a goal stalled when a provider error changes its persisted
     # status to blocked. Recover only when the latest failed or interrupted
-    # turn proves a transient provider/connection failure, not a task blocker.
+    # turn carries a recognized retryable error, not a task blocker.
     if goal["status"] in {"blocked", "stalled"}:
         if not retryable_turn:
             return "goal-blocked"
@@ -553,7 +554,7 @@ def parse_args(argv=None):
     parser.add_argument("--thread", action="append", help="Only watch this thread UUID; repeatable; default: all")
     parser.add_argument("--dry-run", action="store_true", help="Read sessions and log plans; no resume or state writes")
     parser.add_argument("--once", action="store_true", help="Scan once; normal idle grace still applies")
-    parser.add_argument("--errors-only", action="store_true", help="Only resume failed or interrupted turns with capacity/connection errors")
+    parser.add_argument("--errors-only", action="store_true", help="Only resume failed or interrupted turns with recognized retryable errors")
     parser.add_argument("--interval", type=positive, default=15, help="Scan interval in seconds (default: 15)")
     parser.add_argument("--idle-seconds", type=nonnegative, default=60, help="Continuous observed idle grace (default: 60)")
     parser.add_argument("--initial-backoff", type=positive, default=60)

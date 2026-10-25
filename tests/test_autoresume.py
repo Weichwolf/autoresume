@@ -138,6 +138,40 @@ class PolicyTests(unittest.TestCase):
             self.assertIsNone(blocked_reason(snapshot(error=error), errors_only=True))
         self.assertFalse(transient_error({"message": "timeout", "codexErrorInfo": "usageLimitExceeded"}))
 
+    def test_content_display_error_triggers_resume(self):
+        for message in ["This content can’t be shown", "This content can't be shown"]:
+            for field in ["message", "additionalDetails"]:
+                error = {field: message}
+                self.assertTrue(transient_error(error))
+                for goal in ["active", "blocked", "stalled"]:
+                    for status in ["failed", "interrupted"]:
+                        for errors_only in [False, True]:
+                            with self.subTest(message=message, field=field, goal=goal,
+                                              status=status, errors_only=errors_only):
+                                s = snapshot(goal=goal, turn_status=status, error=error)
+                                self.assertIsNone(blocked_reason(s, errors_only=errors_only))
+
+    def test_content_display_error_preserves_non_retryable_errors(self):
+        for info in ["usageLimitExceeded", "misalignmentPolicyViolation",
+                     {"httpConnectionFailed": {"httpStatusCode": 403}}]:
+            with self.subTest(info=info):
+                error = {"message": "This content can’t be shown", "codexErrorInfo": info}
+                self.assertFalse(transient_error(error))
+                self.assertEqual(blocked_reason(snapshot(error=error)), "non-retryable-error")
+
+    def test_cyber_policy_error_triggers_resume(self):
+        for message in ["This content can’t be shown",
+                        "This content was flagged for possible cybersecurity risk."]:
+            error = {"message": message, "codexErrorInfo": "cyberPolicy"}
+            self.assertTrue(transient_error(error))
+            for goal in ["active", "blocked", "stalled"]:
+                for status in ["failed", "interrupted"]:
+                    for errors_only in [False, True]:
+                        with self.subTest(message=message, goal=goal, status=status,
+                                          errors_only=errors_only):
+                            s = snapshot(goal=goal, turn_status=status, error=error)
+                            self.assertIsNone(blocked_reason(s, errors_only=errors_only))
+
 
 class WatchdogTests(unittest.TestCase):
     def setUp(self):
