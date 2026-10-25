@@ -167,6 +167,36 @@ def transient_error(error):
     ))
 
 
+def content_display_error(snapshot):
+    turn = snapshot["turn"]
+    if not turn or turn["status"] not in {"failed", "interrupted"}:
+        return False
+    error = turn.get("error") or {}
+    text = " ".join(str(error.get(k) or "") for k in ("message", "additionalDetails")).lower()
+    return any(message in text for message in (
+        "this content can’t be shown", "this content can't be shown",
+    ))
+
+
+def same_goal(left, right):
+    # Status and updatedAt can change without replacing the goal. Never carry
+    # recovery over to a different objective, budget, or usage accounting.
+    return bool(left and right and all(left.get(key) == right.get(key) for key in (
+        "createdAt", "objective", "tokenBudget", "tokensUsed", "timeUsedSeconds",
+    )))
+
+
+def recovery_reason(snapshot, record, errors_only=False):
+    pending = (record or {}).get("pending_revert")
+    if pending and snapshot["turn"] is None and same_goal(snapshot["goal"], pending["goal"]):
+        if snapshot["goal"]["status"] in {"active", "blocked", "stalled"}:
+            # A successful revert removed the error that justified recovery.
+            # Retain all other guards, including pauses, budgets and running turns.
+            snapshot = {**snapshot, "goal": {**snapshot["goal"], "status": "active"}}
+            return blocked_reason(snapshot, errors_only=False)
+    return blocked_reason(snapshot, errors_only)
+
+
 def blocked_reason(snapshot, errors_only=False):
     goal, turn = snapshot["goal"], snapshot["turn"]
     if not goal or goal["status"] not in {"active", "blocked", "stalled"}:
@@ -265,9 +295,13 @@ class Watchdog:
 
     def check(self, thread_id):
         snapshot = self.rpc.snapshot(thread_id)
-        reason = blocked_reason(snapshot, self.args.errors_only)
         now = self.clock()
         record = self.state.sessions.get(thread_id)
+        pending = (record or {}).get("pending_revert")
+        if pending and (not same_goal(snapshot["goal"], pending["goal"])
+                        or (snapshot["turn"] and snapshot["turn"]["id"] != pending["turn_id"])):
+            record.pop("pending_revert")
+        reason = recovery_reason(snapshot, record, self.args.errors_only)
         if reason:
             if reason == "running-or-waiting" and record:
                 record["idle_since"] = None
@@ -291,17 +325,19 @@ class Watchdog:
         record["running_since"] = None
         due = max(record["idle_since"] + self.args.idle_seconds, record.get("next_attempt", 0))
         if self.args.dry_run:
-            LOG.info("DRY RUN %s: would /goal resume in %.0fs (runtime=%s, turn=%s)",
-                     thread_id, max(0, due - now), snapshot["thread"]["status"]["type"],
+            action = "revert before first turn, then /goal resume" if content_display_error(snapshot) else "/goal resume"
+            LOG.info("DRY RUN %s: would %s in %.0fs (runtime=%s, turn=%s)",
+                     thread_id, action, max(0, due - now), snapshot["thread"]["status"]["type"],
                      (snapshot["turn"] or {}).get("status", "none"))
-            return "would-resume"
+            return "would-revert-and-resume" if content_display_error(snapshot) else "would-resume"
         if now < due:
             return "cooldown"
 
         # Recheck directly before mutation. A manual pause, a new turn, or a
         # changed goal observed here cancels this attempt.
         fresh = self.rpc.snapshot(thread_id)
-        if blocked_reason(fresh, self.args.errors_only) or fingerprint(fresh) != key:
+        if (recovery_reason(fresh, record, self.args.errors_only) or fingerprint(fresh) != key
+                or not same_goal(fresh["goal"], snapshot["goal"])):
             record["idle_since"] = None
             return "changed-before-resume"
 
@@ -319,9 +355,41 @@ class Watchdog:
         if fresh["thread"]["status"]["type"] == "notLoaded":
             self.rpc.call("thread/resume", {"threadId": thread_id, "excludeTurns": True})
             fresh = self.rpc.snapshot(thread_id)
-            if blocked_reason(fresh, self.args.errors_only) or fingerprint(fresh) != key:
+            if (recovery_reason(fresh, record, self.args.errors_only) or fingerprint(fresh) != key
+                    or not same_goal(fresh["goal"], snapshot["goal"])):
                 return "changed-after-load"
+        if content_display_error(fresh):
+            if fresh["thread"].get("ephemeral") or fresh["thread"].get("historyMode") == "legacy":
+                LOG.warning("Skip %s: thread/revert requires persistent paginated history", thread_id)
+                return "unsupported-revert"
+            turns = self.rpc.call("thread/turns/list", {
+                "threadId": thread_id, "limit": 1, "sortDirection": "asc",
+            })["data"]
+            if not turns:
+                return "missing-first-turn"
+            before = fresh
+            fresh = self.rpc.snapshot(thread_id)
+            if (blocked_reason(fresh, self.args.errors_only) or fingerprint(fresh) != key
+                    or not same_goal(fresh["goal"], before["goal"])
+                    or not content_display_error(fresh)):
+                return "changed-before-revert"
+            # Persist before the destructive RPC: if its response is lost, an
+            # empty history on reconnect still authorizes resuming this goal.
+            record["pending_revert"] = {"goal": fresh["goal"], "turn_id": key[1],
+                                        "first_turn_id": turns[0]["id"]}
+            self.state.save()
+            self.rpc.call("thread/revert", {
+                "threadId": thread_id, "beforeTurnId": turns[0]["id"],
+            })
+            LOG.info("REVERT %s: removed all turns starting at %s", thread_id, turns[0]["id"])
+            fresh = self.rpc.snapshot(thread_id)
+            if (fresh["turn"] is not None
+                    or not same_goal(fresh["goal"], record["pending_revert"]["goal"])
+                    or recovery_reason(fresh, record, self.args.errors_only)):
+                return "changed-after-revert"
         self.rpc.resume(thread_id)
+        if record.pop("pending_revert", None) is not None:
+            self.state.save()
         LOG.info("RESUME %s: /goal resume, attempt=%s, cooldown=%.0fs", thread_id, record["attempts"], delay)
         # The server sends the RPC response before applying runtime effects, so
         # immediate idle is not proof of failure. Later scans verify progress

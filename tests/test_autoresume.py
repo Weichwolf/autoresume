@@ -17,7 +17,8 @@ from autoresume import (
 
 def snapshot(runtime="idle", goal="active", turn_status="failed", error=None):
     return {
-        "thread": {"id": "t1", "status": {"type": runtime}},
+        "thread": {"id": "t1", "status": {"type": runtime},
+                   "historyMode": "paginated", "ephemeral": False},
         "goal": {"status": goal, "createdAt": 10, "objective": "Finish work",
                  "tokensUsed": 100, "tokenBudget": 1000} if goal else None,
         "turn": {"id": "turn1", "status": turn_status,
@@ -33,6 +34,8 @@ class FakeRpc:
         self.actions = []
         self.before_read = None
         self.resume_error = None
+        self.requests = []
+        self.first_turn_id = "oldest-turn"
 
     def threads(self):
         return [{"id": key} for key in self.snapshots]
@@ -49,8 +52,13 @@ class FakeRpc:
 
     def call(self, method, params):
         self.actions.append((method, params["threadId"]))
+        self.requests.append((method, params))
         if method == "thread/resume":
             self.snapshots[params["threadId"]]["thread"]["status"] = {"type": "idle"}
+        elif method == "thread/turns/list":
+            return {"data": [{"id": self.first_turn_id}]}
+        elif method == "thread/revert":
+            self.snapshots[params["threadId"]]["turn"] = None
         return {}
 
 
@@ -184,6 +192,156 @@ class WatchdogTests(unittest.TestCase):
         self.rpc = FakeRpc({"t1": snapshot()})
         self.watch = Watchdog(self.rpc, self.state, self.args, clock=lambda: self.now,
                               jitter=lambda low, high: 1)
+
+    def content_failure(self, **kwargs):
+        self.args.idle_seconds = 0
+        self.rpc.snapshots["t1"] = snapshot(
+            error={"message": "This content can’t be shown", "codexErrorInfo": "cyberPolicy"},
+            **kwargs,
+        )
+
+    def test_content_failure_reverts_before_oldest_turn_then_resumes_same_goal(self):
+        self.content_failure(goal="blocked", turn_status="interrupted")
+        self.args.errors_only = True
+        goal = copy.deepcopy(self.rpc.snapshots["t1"]["goal"])
+        self.assertEqual(self.watch.scan()["resumed"], 1)
+        self.assertEqual(self.rpc.actions, [
+            ("thread/turns/list", "t1"), ("thread/revert", "t1"), ("resume", "t1"),
+        ])
+        self.assertEqual(self.rpc.requests, [
+            ("thread/turns/list", {"threadId": "t1", "limit": 1, "sortDirection": "asc"}),
+            ("thread/revert", {"threadId": "t1", "beforeTurnId": "oldest-turn"}),
+        ])
+        self.assertEqual(self.rpc.snapshots["t1"]["goal"], goal)
+        self.assertNotIn("pending_revert", State(self.path).sessions["t1"])
+
+    def test_content_failure_keeps_idle_grace(self):
+        self.content_failure()
+        self.args.idle_seconds = 60
+        self.watch.scan()
+        self.now += 59
+        self.watch.scan()
+        self.assertEqual(self.rpc.actions, [])
+        self.now += 1
+        self.watch.scan()
+        self.assertIn(("thread/revert", "t1"), self.rpc.actions)
+
+    def test_content_failure_dry_run_only_describes_reset(self):
+        self.content_failure(runtime="notLoaded")
+        self.args.dry_run = True
+        with self.assertLogs("autoresume", level="INFO") as logs:
+            self.assertEqual(self.watch.scan()["would-revert-and-resume"], 1)
+        self.assertIn("revert before first turn", " ".join(logs.output))
+        self.assertEqual(self.rpc.actions, [])
+        self.assertFalse(self.path.exists())
+
+    def test_content_failure_loads_dormant_thread_before_revert(self):
+        self.content_failure(runtime="notLoaded")
+        self.watch.scan()
+        self.assertEqual(self.rpc.actions, [
+            ("thread/resume", "t1"), ("thread/turns/list", "t1"),
+            ("thread/revert", "t1"), ("resume", "t1"),
+        ])
+
+    def test_unsupported_history_never_falls_back_to_resume(self):
+        for metadata in [{"historyMode": "legacy"}, {"ephemeral": True}]:
+            with self.subTest(metadata=metadata):
+                self.content_failure()
+                self.state.sessions.clear()
+                self.rpc.snapshots["t1"]["thread"].update(metadata)
+                self.assertEqual(self.watch.scan()["unsupported-revert"], 1)
+                self.assertEqual(self.rpc.actions, [])
+
+    def test_content_failure_rechecks_for_user_changes_before_revert(self):
+        for change in ["pause", "running", "new-turn", "objective", "error"]:
+            with self.subTest(change=change):
+                self.content_failure()
+                self.state.sessions.clear()
+                self.rpc.actions.clear()
+                reads = 0
+
+                def race(_):
+                    nonlocal reads
+                    reads += 1
+                    if reads == 3:
+                        s = self.rpc.snapshots["t1"]
+                        if change == "pause":
+                            s["goal"]["status"] = "paused"
+                        elif change == "running":
+                            s["thread"]["status"]["type"] = "active"
+                        elif change == "new-turn":
+                            s["turn"]["id"] = "new"
+                        elif change == "objective":
+                            s["goal"]["objective"] = "Different task"
+                        else:
+                            s["turn"]["error"] = {"codexErrorInfo": "serverOverloaded"}
+
+                self.rpc.before_read = race
+                self.assertEqual(self.watch.scan()["changed-before-revert"], 1)
+                self.assertEqual(self.rpc.actions, [("thread/turns/list", "t1")])
+
+    def test_lost_revert_response_recovers_after_restart_without_second_revert(self):
+        self.content_failure(goal="blocked")
+        self.args.errors_only = True
+        original = self.rpc.call
+
+        def lost_response(method, params):
+            if method == "thread/revert":
+                pending = State(self.path).sessions["t1"]["pending_revert"]
+                self.assertEqual(pending["goal"], self.rpc.snapshots["t1"]["goal"])
+                original(method, params)
+                raise TimeoutError("revert response lost")
+            return original(method, params)
+
+        self.rpc.call = lost_response
+        with self.assertRaises(TimeoutError):
+            self.watch.scan()
+        self.watch.state = State(self.path)
+        self.rpc.call = original
+        self.assertEqual(self.watch.scan()["cooldown"], 1)
+        self.now += 60
+        self.assertEqual(self.watch.scan()["resumed"], 1)
+        self.assertEqual(self.rpc.actions.count(("thread/revert", "t1")), 1)
+        self.assertEqual(self.rpc.actions[-1], ("resume", "t1"))
+
+    def test_revert_failure_never_resumes(self):
+        self.content_failure()
+        original = self.rpc.call
+
+        def fail(method, params):
+            if method == "thread/revert":
+                raise RpcError(method, {"message": "unsupported history"})
+            return original(method, params)
+
+        self.rpc.call = fail
+        self.assertEqual(self.watch.scan()["rpc-error"], 1)
+        self.assertNotIn(("resume", "t1"), self.rpc.actions)
+
+    def test_user_pause_after_revert_prevents_resume(self):
+        self.content_failure()
+        original = self.rpc.call
+
+        def pause(method, params):
+            result = original(method, params)
+            if method == "thread/revert":
+                self.rpc.snapshots["t1"]["goal"]["status"] = "paused"
+            return result
+
+        self.rpc.call = pause
+        self.assertEqual(self.watch.scan()["changed-after-revert"], 1)
+        self.assertNotIn(("resume", "t1"), self.rpc.actions)
+
+    def test_pending_reset_does_not_resume_replaced_goal(self):
+        self.content_failure(goal="blocked")
+        self.rpc.resume_error = TimeoutError("resume response lost")
+        with self.assertRaises(TimeoutError):
+            self.watch.scan()
+        self.watch.state = State(self.path)
+        self.rpc.snapshots["t1"]["goal"]["objective"] = "New blocked task"
+        self.rpc.resume_error = None
+        self.now += 60
+        self.assertEqual(self.watch.scan()["goal-blocked"], 1)
+        self.assertEqual(self.rpc.actions.count(("resume", "t1")), 1)
 
     def test_idle_grace_and_resume_all_active_sessions(self):
         self.rpc.snapshots.update(t2=snapshot(), paused=snapshot(goal="paused"))
@@ -401,6 +559,8 @@ class ProtocolTests(unittest.TestCase):
         self.runtime = "idle"
         self.goal_status = "active"
         self.turn = snapshot()["turn"]
+        self.revert_requests = []
+        self.oldest_turn = {"id": "first-turn", "status": "completed"}
         self.disconnect_once = False
         self.resumed = threading.Event()
         self.server = unix_serve(self.handler, str(self.sock))
@@ -435,7 +595,13 @@ class ProtocolTests(unittest.TestCase):
             elif method == "thread/goal/get":
                 result = {"goal": snapshot(goal=self.goal_status)["goal"]}
             elif method == "thread/turns/list":
-                result = {"data": [self.turn]}
+                turn = self.oldest_turn if params.get("sortDirection") == "asc" else self.turn
+                result = {"data": [turn] if turn else []}
+            elif method == "thread/revert":
+                self.revert_requests.append(params)
+                self.turn = None
+                self.oldest_turn = None
+                result = {"thread": {"id": params["threadId"], "turns": []}}
             elif method == "thread/goal/set":
                 self.mutations.append(params)
                 self.runtime = "active"
@@ -471,6 +637,26 @@ class ProtocolTests(unittest.TestCase):
                        "--once", "--idle-seconds", "0", "--thread", "t1"])
         self.assertEqual(result, 0)
         self.assertEqual(len(self.mutations), 1)
+
+    def test_cli_content_error_reverts_entire_history_then_resumes(self):
+        for message, field in [("This content can’t be shown", "message"),
+                               ("This content can't be shown", "additionalDetails")]:
+            with self.subTest(message=message):
+                self.methods.clear()
+                self.mutations.clear()
+                self.revert_requests.clear()
+                self.oldest_turn = {"id": "first-turn", "status": "completed"}
+                self.goal_status = "blocked"
+                self.runtime = "systemError"
+                self.turn = snapshot(turn_status="interrupted", error={field: message})["turn"]
+                with tempfile.TemporaryDirectory() as state_dir:
+                    result = main(["--socket", str(self.sock), "--state-dir", state_dir,
+                                   "--once", "--idle-seconds", "0", "--thread", "t1", "--errors-only"])
+                self.assertEqual(result, 0)
+                self.assertEqual(self.revert_requests, [{"threadId": "t1", "beforeTurnId": "first-turn"}])
+                self.assertEqual(self.mutations, [{"threadId": "t1", "status": "active", "origin": "user"}])
+                self.assertLess(self.methods.index("thread/revert"), self.methods.index("thread/goal/set"))
+                self.assertNotIn("thread/goal/clear", self.methods)
 
     def test_cli_recovers_interrupted_goal_with_connection_error(self):
         self.goal_status = "blocked"
